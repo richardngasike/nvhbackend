@@ -10,97 +10,96 @@ const router = express.Router();
 // ==================== REGISTER ====================
 router.post('/register', async (req, res) => {
   try {
+    console.log('Registration attempt:', req.body);
+
     const { name, email, phone, password } = req.body;
 
-    // Input validation
+    // === Input Validation ===
     if (!name || !email || !phone || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
 
-    if (password.length < 6) {
+    if (typeof password !== 'string' || password.trim().length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    const trimmedEmail = email.toLowerCase().trim();
+    const cleanName = name.trim();
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanPhone = phone.trim();
 
-    // Check if email already exists
+    // === Check if user already exists ===
     const existingUser = await db.query(
       'SELECT id FROM users WHERE email = $1',
-      [trimmedEmail]
+      [cleanEmail]
     );
 
     if (existingUser.rows.length > 0) {
+      console.log('Duplicate email attempt:', cleanEmail);
       return res.status(400).json({ error: 'Email already registered' });
     }
 
-    // Optional: Check phone uniqueness (uncomment if needed)
-    // const phoneCheck = await db.query('SELECT id FROM users WHERE phone = $1', [phone.trim()]);
-    // if (phoneCheck.rows.length > 0) {
-    //   return res.status(400).json({ error: 'Phone number already in use' });
-    // }
+    // === Hash password ===
+    const hashedPassword = await bcrypt.hash(password.trim(), 12);
 
-    // Hash password
-    const salt = await bcrypt.genSalt(12);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Create user
+    // === Insert new user ===
     const result = await db.query(
-      `INSERT INTO users (name, email, phone, password, created_at) 
-       VALUES ($1, $2, $3, $4, NOW()) 
+      `INSERT INTO users (name, email, phone, password, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
        RETURNING id, name, email, phone`,
-      [name.trim(), trimmedEmail, phone.trim(), hashedPassword]
+      [cleanName, cleanEmail, cleanPhone, hashedPassword]
     );
 
     const user = result.rows[0];
+    console.log('New user created:', user.id, user.email);
 
-    // Critical: Check if JWT_SECRET exists
-    if (!process.env.JWT_SECRET) {
-      console.error('JWT_SECRET is missing in .env file!');
-      return res.status(500).json({ error: 'Server configuration error' });
+    // === CRITICAL: Verify JWT_SECRET exists ===
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 20) {
+      console.error('FATAL: JWT_SECRET is missing or too short!');
+      return res.status(500).json({ error: 'Server configuration error. Contact admin.' });
     }
 
-    // Generate JWT token
+    // === Generate JWT ===
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
-    // Success response
-    res.status(201).json({
-      message: 'User registered successfully',
+    // === SUCCESS ===
+    return res.status(201).json({
+      message: 'Registration successful!',
+      token,
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
         phone: user.phone
-      },
-      token
+      }
     });
 
   } catch (error) {
-    console.error('Registration Error:', error.message);
-    console.error('Full error:', error);
+    console.error('REGISTRATION FAILED:', error.message);
+    console.error('Full error object:', error);
 
-    // Handle specific PostgreSQL errors
-    if (error.code === '23505') { // Unique violation
+    // PostgreSQL unique constraint violation
+    if (error.code === '23505') {
       if (error.constraint?.includes('email')) {
         return res.status(400).json({ error: 'Email already registered' });
       }
       if (error.constraint?.includes('phone')) {
-        return res.status(400).json({ error: 'Phone number already registered' });
+        return res.status(400).json({ error: 'Phone number already in use' });
       }
     }
 
     // JWT errors
-    if (error.name === 'JsonWebTokenError') {
+    if (error.name === 'JsonWebTokenError' || error.message.includes('secret')) {
       return res.status(500).json({ error: 'Authentication system error' });
     }
 
-    res.status(500).json({ 
+    return res.status(500).json({
       error: 'Registration failed. Please try again later.',
       // Remove this line in production
-      // debug: error.message 
+      // debug: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -114,12 +113,11 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const trimmedEmail = email.toLowerCase().trim();
+    const cleanEmail = email.toLowerCase().trim();
 
-    // Find user
     const result = await db.query(
       'SELECT id, name, email, phone, password FROM users WHERE email = $1',
-      [trimmedEmail]
+      [cleanEmail]
     );
 
     if (result.rows.length === 0) {
@@ -128,47 +126,51 @@ router.post('/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Compare password
-    const isValidPassword = await bcrypt.compare(password, user.password);
-    if (!isValidPassword) {
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // Generate token
     if (!process.env.JWT_SECRET) {
-      console.error('JWT_SECRET missing!');
-      return res.status(500).json({ error: 'Server configuration error' });
+      console.error('JWT_SECRET missing during login');
+      return res.status(500).json({ error: 'Server error' });
     }
 
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
-    res.json({
+    return res.json({
       message: 'Login successful',
+      token,
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
         phone: user.phone
-      },
-      token
+      }
     });
 
   } catch (error) {
-    console.error('Login Error:', error.message);
-    res.status(500).json({ error: 'Login failed. Please try again.' });
+    console.error('LOGIN FAILED:', error);
+    return res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
-// ==================== GET CURRENT USER (Protected) ====================
+// ==================== GET CURRENT USER ====================
 router.get('/me', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const result = await db.query(
       'SELECT id, name, email, phone, created_at FROM users WHERE id = $1',
-      [req.user.userId]  // Fixed: use req.user.userId from authMiddleware
+      [userId]
     );
 
     if (result.rows.length === 0) {
@@ -176,9 +178,10 @@ router.get('/me', authMiddleware, async (req, res) => {
     }
 
     res.json({ user: result.rows[0] });
+
   } catch (error) {
-    console.error('Get user error:', error);
-    res.status(500).json({ error: 'Failed to fetch user profile' });
+    console.error('GET /me error:', error);
+    res.status(500).json({ error: 'Failed to load profile' });
   }
 });
 
